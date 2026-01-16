@@ -3,7 +3,7 @@
 Project Axiom: Young Link Replay Filter
 
 Filters raw .slp replay files to extract only Young Link matches.
-Uses peppi-py for fast parsing.
+Uses py-slippi for stable parsing (peppi-py has Rust panic issues).
 
 Usage:
     python scripts/filter_young_link.py \
@@ -19,21 +19,18 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional
 import sys
+import traceback
 
 try:
-    import peppi_py as peppi
+    from slippi import Game
+    from slippi.id import CSSCharacter
 except ImportError:
-    print("peppi-py not installed. Run: pip install peppi-py")
+    print("py-slippi not installed. Run: pip install py-slippi")
     sys.exit(1)
 
 
-# Young Link character IDs
-# External ID used in Slippi metadata
-YOUNG_LINK_EXTERNAL_ID = 0x14  # 20 decimal
-YOUNG_LINK_INTERNAL_ID = 22
-
-# Alternative: some parsers use different ID schemes
-YOUNG_LINK_IDS = {20, 22, 0x14}
+# Young Link character ID in py-slippi
+YOUNG_LINK_CSS_ID = 21  # CSSCharacter enum value for Young Link
 
 
 @dataclass
@@ -49,88 +46,62 @@ class ReplayMetadata:
     date: Optional[str]
 
 
-def get_character_id(player) -> Optional[int]:
-    """Extract character ID from player data."""
-    if player is None:
-        return None
-
-    # Try different attribute paths (peppi-py version dependent)
-    if hasattr(player, 'character'):
-        char = player.character
-        if hasattr(char, 'external'):
-            return char.external
-        if hasattr(char, 'value'):
-            return char.value
-        if isinstance(char, int):
-            return char
-
-    return None
-
-
-def get_connect_code(player) -> Optional[str]:
-    """Extract Slippi connect code from player."""
-    if player is None:
-        return None
-
-    if hasattr(player, 'netplay'):
-        netplay = player.netplay
-        if netplay and hasattr(netplay, 'code'):
-            return netplay.code
-
-    return None
-
-
-def is_young_link(character_id: Optional[int]) -> bool:
-    """Check if character ID is Young Link."""
-    if character_id is None:
+def is_young_link(char_id) -> bool:
+    """Check if character is Young Link."""
+    if char_id is None:
         return False
-    return character_id in YOUNG_LINK_IDS
+    # Handle both enum and int
+    if hasattr(char_id, 'value'):
+        return char_id.value == YOUNG_LINK_CSS_ID
+    return char_id == YOUNG_LINK_CSS_ID
 
 
 def parse_replay(filepath: Path) -> Optional[dict]:
     """Parse a replay file and extract relevant info."""
     try:
-        game = peppi.read_slippi(str(filepath))
+        # Skip tiny files
+        if filepath.stat().st_size < 1000:
+            return None
 
-        # Get game start info
-        start = game.start if hasattr(game, 'start') else game
+        game = Game(str(filepath))
 
-        # Find players
-        players = []
-        if hasattr(start, 'players'):
-            players = [p for p in start.players if p is not None]
-        elif hasattr(game, 'metadata') and hasattr(game.metadata, 'players'):
-            players = [p for p in game.metadata.players if p is not None]
+        if game.start is None:
+            return None
 
-        if len(players) < 2:
+        # Get players
+        players = game.start.players
+        if players is None:
+            return None
+
+        active_players = [p for p in players if p is not None]
+        if len(active_players) < 2:
             return None
 
         # Get frame count
         frame_count = 0
-        if hasattr(game, 'frames'):
+        if game.frames is not None:
             frame_count = len(game.frames)
-        elif hasattr(game, 'metadata') and hasattr(game.metadata, 'duration'):
+        elif game.metadata is not None and game.metadata.duration is not None:
             frame_count = game.metadata.duration
 
         # Get stage
         stage = 0
-        if hasattr(start, 'stage'):
-            stage = start.stage if isinstance(start.stage, int) else getattr(start.stage, 'value', 0)
+        if game.start.stage is not None:
+            stage = game.start.stage.value if hasattr(game.start.stage, 'value') else int(game.start.stage)
 
         # Get date
         date = None
-        if hasattr(game, 'metadata') and hasattr(game.metadata, 'date'):
+        if game.metadata is not None and game.metadata.date is not None:
             date = str(game.metadata.date)
 
         return {
-            'players': players,
+            'players': active_players,
             'frame_count': frame_count,
             'stage': stage,
             'date': date,
         }
 
-    except Exception as e:
-        print(f"  [WARN] Failed to parse {filepath.name}: {e}")
+    except Exception:
         return None
 
 
@@ -154,8 +125,8 @@ def filter_replays(
     skipped_parse_error = 0
 
     for i, filepath in enumerate(slp_files):
-        if verbose and (i + 1) % 100 == 0:
-            print(f"  Processed {i + 1}/{len(slp_files)}...")
+        if verbose and (i + 1) % 500 == 0:
+            print(f"  Processed {i + 1}/{len(slp_files)}... (found {len(filtered)} YL matches)")
 
         # Parse replay
         data = parse_replay(filepath)
@@ -176,13 +147,17 @@ def filter_replays(
         opponent_code = None
 
         for idx, player in enumerate(players):
-            char_id = get_character_id(player)
-            if is_young_link(char_id):
+            if player is None:
+                continue
+            char = player.character
+            if is_young_link(char):
                 yl_port = idx
-                yl_player_code = get_connect_code(player)
+                # py-slippi uses tag instead of netplay
+                yl_player_code = getattr(player, 'tag', None)
             else:
-                opponent_char = char_id
-                opponent_code = get_connect_code(player)
+                if char is not None:
+                    opponent_char = char.value if hasattr(char, 'value') else int(char)
+                opponent_code = getattr(player, 'tag', None)
 
         if yl_port is None:
             skipped_no_yl += 1
